@@ -4,6 +4,13 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav_msgs.msg import Path
+import struct
+from scipy.spatial.transform import Rotation as R
+
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from gui import gui_utils
@@ -16,8 +23,11 @@ from utils.slam_utils import get_loss_tracking, get_median_depth
 
 
 class FrontEnd(mp.Process):
-    def __init__(self, config):
+    def __init__(self, config, cloud_pub, traj_pub, node):
         super().__init__()
+        self.node = node
+        self.cloud_pub = cloud_pub
+        self.traj_pub = traj_pub
         self.config = config
         self.background = None
         self.pipeline_params = None
@@ -313,6 +323,107 @@ class FrontEnd(mp.Process):
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
 
+    def publish_counter(self):
+        points, colors = self.gaussians.generate_pcd(self.config["Dataset"]["type"] == "ROS")
+        cloud_msg = self.create_pointcloud2_msg(points, colors)
+        self.cloud_pub.publish(cloud_msg)
+        traj_msg = self.generate_trajectory_message(self.cameras, self.config["Dataset"]["type"] == "ROS")
+        self.traj_pub.publish(traj_msg)
+
+    def create_pointcloud2_msg(self, points, colors):
+        msg = PointCloud2()
+
+        header = Header()
+        header.stamp = self.node.get_clock().now().to_msg()
+        header.frame_id = 'map'  # Change to your desired frame ID
+        msg.header = header
+
+        msg.height = 1
+        msg.width = len(points)
+        msg.fields.append(PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1))
+        msg.fields.append(PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1))
+        msg.fields.append(PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1))
+        msg.fields.append(PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1))
+        msg.point_step = 16  # 4 floats for XYZ + 1 UINT32 for RGB
+        msg.row_step = msg.point_step * msg.width
+        msg.is_dense = True
+        msg.is_bigendian = False
+        msg.data = []
+
+        for point, color in zip(points, colors):
+            # Scale colors to the range [0, 255] and clip them
+            color_scaled = np.clip(color * 255, 0, 255).astype(np.uint8)
+
+            # Pack the RGB color into a UINT32 value
+            rgb = (color_scaled[0] << 16) | (color_scaled[1] << 8) | color_scaled[2]
+
+            # Append the XYZ coordinates to msg.data
+            msg.data.extend(struct.pack('fff', *point))
+
+            # Append the packed RGB color to msg.data
+            msg.data.extend(struct.pack('<I', rgb))
+            
+        return msg
+    
+    def gen_pose_matrix(self, R, T):
+        pose = np.eye(4)
+        pose[0:3, 0:3] = R.cpu().numpy()
+        pose[0:3, 3] = T.cpu().numpy()
+        return pose
+    
+    def generate_trajectory_message(self, cameras, is_ROS = False):
+        trajectory_msg = Path()
+        trajectory_msg.header.frame_id = 'map'  # Change to your desired frame ID
+
+        for camera_id, camera in cameras.items():
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = self.node.get_clock().now().to_msg()
+            pose_msg.header.frame_id = 'map'  # Change to your desired frame ID
+
+            # Move rotation matrix and translation vector to CPU
+            transform = np.linalg.inv(self.gen_pose_matrix(camera.R, camera.T))
+            # Extract translation and rotation from transformation matrix
+            translation = transform[:3, 3]
+            rotation = transform[:3, :3]
+
+            # TODO: Need to validate if the frames are correct, seems slightly off
+            if is_ROS:
+                # Transformation matrix from left-handed (x-left, z-forward) to right-handed (z-up, x-forward)
+                T_lh_to_rh = np.array([
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, -1, 0, 0],
+                [0, 0, 0, 1]
+                ])
+                transform_rh = T_lh_to_rh @ transform 
+                # Convert from left-handed to right-handed coordinate system
+                translation_transformed = transform[:3, 3]
+
+                rotation_transformed = transform[:3, :3]
+            else:
+                translation_transformed = translation
+                rotation_transformed = rotation
+
+            # Convert rotation matrix to quaternion
+            quaternion = R.from_matrix(rotation_transformed).as_quat()
+
+            # Normalize quaternion
+            quaternion /= np.linalg.norm(quaternion)
+
+            # Fill pose message
+            pose_msg.pose.position.x = translation_transformed[0].item()
+            pose_msg.pose.position.y = translation_transformed[1].item()
+            pose_msg.pose.position.z = translation_transformed[2].item()
+            pose_msg.pose.orientation = Quaternion(
+                x=quaternion[0].item(),
+                y=quaternion[1].item(),
+                z=quaternion[2].item(),
+                w=quaternion[3].item()
+            )
+            trajectory_msg.poses.append(pose_msg)
+
+        return trajectory_msg
+
     def run(self):
         cur_frame_idx = 0
         projection_matrix = getProjectionMatrix2(
@@ -475,6 +586,8 @@ class FrontEnd(mp.Process):
                 toc.record()
                 torch.cuda.synchronize()
                 if create_kf:
+                    if self.gaussians is not None:
+                        self.publish_counter()
                     # throttle at 3fps when keyframe is added
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))

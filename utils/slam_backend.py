@@ -29,7 +29,7 @@ class BackEnd(mp.Process):
         self.pause = False
         self.device = "cuda"
         self.dtype = torch.float32
-        self.monocular = config["Training"]["monocular"]
+        self.monocular = config["Training"]["monocular"] or config["Dataset"]["type"] == "ROS"
         self.iteration_count = 0
         self.last_sent = 0
         self.occ_aware_visibility = {}

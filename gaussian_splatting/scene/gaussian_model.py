@@ -359,6 +359,88 @@ class GaussianModel:
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
+    def generate_pcd(self, is_ROS = False):
+        xyz = self._xyz.detach().cpu().numpy()
+        if is_ROS:
+            # TODO: Need to validate if the transform is correct, seems like it is slightly off
+            T_corrected = np.array([
+            [0, 0, 1, 0],  # X-forward is the old Z-forward
+            [1, 0, 0, 0],  # Y-up remains Y-up
+            [0, 1, 0, 0],  # Z-up is the old X-right
+            [0, 0, 0, 1]
+            ])
+            # Transform coordinates
+            ones = np.ones((xyz.shape[0], 1))
+            xyz_homogeneous = np.hstack((xyz, ones))  # Convert to homogeneous coordinates
+            xyz_transformed = (T_corrected @ xyz_homogeneous.T).T[:, :3]
+        else:
+            xyz_transformed = xyz
+        normals = np.zeros_like(xyz_transformed)
+        f_dc = (
+            self._features_dc.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        f_rest = (
+            self._features_rest.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [
+            (attribute, "f4") for attribute in self.construct_list_of_attributes()
+        ]
+        elements = np.empty(xyz_transformed.shape[0], dtype=dtype_full)
+        attributes = np.concatenate(
+            (xyz_transformed, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+        )
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, "vertex")
+        outply = PlyData([el])
+        pcd = self.process_ply_to_pcd(outply)
+        # Extract points, colors, and normals
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+
+        return points, colors
+
+
+    def process_ply_to_pcd(self, plydata):
+        vert = plydata["vertex"]
+        sorted_indices = np.argsort(
+            -np.exp(vert["scale_0"] + vert["scale_1"] + vert["scale_2"])
+            / (1 + np.exp(-vert["opacity"]))
+        )
+        points = []
+        colors = []
+        for idx in sorted_indices:
+            v = plydata["vertex"][idx]
+            position = np.array([v["x"], v["y"], v["z"]], dtype=np.float32)
+            points.append(position)
+            SH_C0 = 0.28209479177387814
+            color = np.array(
+                [
+                    0.5 + SH_C0 * v["f_dc_0"],
+                    0.5 + SH_C0 * v["f_dc_1"],
+                    0.5 + SH_C0 * v["f_dc_2"]
+                ], dtype=np.float32
+            )
+            colors.append(color)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        return pcd
+    
+
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.ones_like(self.get_opacity) * 0.01)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")

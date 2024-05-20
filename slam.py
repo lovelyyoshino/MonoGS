@@ -9,6 +9,11 @@ import torch.multiprocessing as mp
 import yaml
 from munch import munchify
 
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2
+from nav_msgs.msg import Path
+
 import wandb
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.system_utils import mkdir_p
@@ -24,6 +29,9 @@ from utils.slam_frontend import FrontEnd
 
 class SLAM:
     def __init__(self, config, save_dir=None):
+        self.node = rclpy.create_node("monoGS")
+        self.cloud_publisher = self.node.create_publisher(PointCloud2, '/monoGS/cloud', 10)
+        self.trajectory_publisher = self.node.create_publisher(Path, '/monoGS/trajectory', 10)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -40,7 +48,7 @@ class SLAM:
             pipeline_params,
         )
 
-        self.live_mode = self.config["Dataset"]["type"] == "realsense"
+        self.live_mode = self.config["Dataset"]["type"] in ["realsense", "ROS"]
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
         self.use_gui = self.config["Results"]["use_gui"]
@@ -69,7 +77,7 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
-        self.frontend = FrontEnd(self.config)
+        self.frontend = FrontEnd(self.config, self.cloud_publisher, self.trajectory_publisher, self.node)
         self.backend = BackEnd(self.config)
 
         self.frontend.dataset = self.dataset
@@ -197,7 +205,6 @@ class SLAM:
     def run(self):
         pass
 
-
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -248,11 +255,12 @@ if __name__ == "__main__":
         )
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
-
+    rclpy.init()
     slam = SLAM(config, save_dir=save_dir)
 
     slam.run()
     wandb.finish()
 
     # All done
+    rclpy.shutdown()
     Log("Done.")
