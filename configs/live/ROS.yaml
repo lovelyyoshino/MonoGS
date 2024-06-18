@@ -82,4 +82,5 @@ ROS_topics:
   camera_topic: '/zed2i/zed_node/rgb/image_rect_color'
   camera_info_topic: 'None'
   depth_topic: 'None'
+  pointcloud_topic: '/zed2i/zed_node/point_cloud/cloud_registered'
   depth_scale: 1
