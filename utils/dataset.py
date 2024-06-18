@@ -20,6 +20,10 @@ except Exception:
 from unidepth.models import UniDepthV2
 import rclpy
 from sensor_msgs.msg import Image as ROSImage, CameraInfo
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs import point_cloud2
+import pcl
+from pcl import PointCloud_PointXYZRGB
 from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import threading
@@ -569,12 +573,14 @@ class ROSDataset(BaseDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         self.depth_model = None
-        if self.config["ROS_topics"]["depth_topic"] == 'None' or self.config["ROS_topics"]["camera_info_topic"] == 'None':
-            self.depth_model = UniDepthV2.from_pretrained("lpiccinelli/unidepth-v2-vitl14")
-            self.depth_model.to("cuda:0")
+        # if self.config["ROS_topics"]["depth_topic"] == 'None' or self.config["ROS_topics"]["camera_info_topic"] == 'None':
+        #     self.depth_model = UniDepthV2.from_pretrained("lpiccinelli/unidepth-v2-vitl14")
+        #     self.depth_model.to("cuda:0")
         self.bridge = CvBridge()
         self.image = None
+        self.pointcloud = None
         self.image_received = False
+        self.pointcloud_received = False
         self.depth = None
         self.fx = None
         self.fy = None
@@ -594,32 +600,37 @@ class ROSDataset(BaseDataset):
         else:
             self.node.get_logger().warn("Camera Info not provided, UniDepthV2 will estimate intrensics/parameters and assume image is not distorted!")
             self.disorted = False
-        if self.config["ROS_topics"]["depth_topic"] == 'None':
+        if self.config["ROS_topics"]["depth_topic"] == 'None' and self.config["ROS_topics"]["pointcloud_topic"] == 'None':
             self.image_sub = self.node.create_subscription(ROSImage, str(self.config["ROS_topics"]["camera_topic"]), self.image_callback, 1)
             self.node.get_logger().warn("Depth topic not provided, depth will be estimated by UniDepthV2!")
-        else:
+        elif self.config["ROS_topics"]["depth_topic"] != 'None':
             # Create subscribers with message filters
             self.image_sub = message_filters.Subscriber(self.node, ROSImage, str(self.config["ROS_topics"]["camera_topic"]))
             self.depth_sub = message_filters.Subscriber(self.node, ROSImage, self.config["ROS_topics"]["depth_topic"])
             # Synchronize the topics
             self.ts = message_filters.ApproximateTimeSynchronizer([self.image_sub, self.depth_sub], queue_size = 1, slop = 0.1)
             self.ts.registerCallback(self.common_callback)
-        self.depth_scale = float(self.config["ROS_topics"]['depth_scale'])
-        self.has_depth = True if self.config["Dataset"]["sensor_type"] == "depth" else False
+        else:
+            self.pointcloud_sub = self.node.create_subscription(self.node, PointCloud2, str(self.config["ROS_topics"]["pointcloud_topic"]), self.pointcloudxyzrgb_callback, 1)
+            self.node.get_logger().warn("Get Pointcloud topic, this need by Livox Color!")
+
+
+        # self.depth_scale = float(self.config["ROS_topics"]['depth_scale'])
+        # self.has_depth = True if self.config["Dataset"]["sensor_type"] == "depth" else False
         
-        while self.__check_all_parameters__() or not self.image_received:
-            self.node.get_logger().warn("Waiting for camera to start and camera intrensics/parameters to get set....")
-            rclpy.spin_once(self.node, timeout_sec=0.1)
-            if self.config["ROS_topics"]["camera_info_topic"] == 'None' and self.image is not None:
-                self.estimateIntrensics(self.image)
-        if not self.__check_all_parameters__() and self.config["ROS_topics"]["camera_info_topic"] != 'None':
-            self.node.destroy_subscription(self.cameraInfo_sub)
-            self.node.get_logger().info("Successfully loaded intrensics/camera parameters.")
-        self.map1x, self.map1y = None, None
-        if self.disorted:
-            self.map1x, self.map1y = cv2.initUndistortRectifyMap(
-                self.K, self.dist_coeffs, np.eye(3), self.K, (self.width, self.height), cv2.CV_32FC1
-            )
+        # while self.__check_all_parameters__() or (not self.image_received and not self.pointcloud_received) :
+        #     self.node.get_logger().warn("Waiting for camera to start and camera intrensics/parameters to get set....")
+        #     rclpy.spin_once(self.node, timeout_sec=0.1)
+        #     if self.config["ROS_topics"]["camera_info_topic"] == 'None' and self.image is not None:
+        #         self.estimateIntrensics(self.image)
+        # if not self.__check_all_parameters__() and self.config["ROS_topics"]["camera_info_topic"] != 'None':
+        #     self.node.destroy_subscription(self.cameraInfo_sub)
+        #     self.node.get_logger().info("Successfully loaded intrensics/camera parameters.")
+        # self.map1x, self.map1y = None, None
+        # if self.disorted:
+        #     self.map1x, self.map1y = cv2.initUndistortRectifyMap(
+        #         self.K, self.dist_coeffs, np.eye(3), self.K, (self.width, self.height), cv2.CV_32FC1
+        #     )
         # Spin node in a separate thread
         self.spin_thread = threading.Thread(target=self.spin)
         self.spin_thread.start()
@@ -651,6 +662,52 @@ class ROSDataset(BaseDataset):
         self.fovx = focal2fov(self.fx, self.width)
         self.fovy = focal2fov(self.fy, self.height)
         self.node.get_logger().info("Camera parameters set.")
+
+    def pointcloudxyzrgb_callback(self, msg):
+        assert isinstance(msg, PointCloud2)
+        self.pointcloud_received = True
+        self.node.get_logger().info("Pointcloud received.")
+        try:
+            gen = point_cloud2.read_points(msg, field_names=("x", "y", "z", "rgb"), skip_nans=True)
+             # 将点云数据转换为PCL格式
+            pcl_cloud = pcl.PointCloud_PointXYZRGB()
+            for p in gen:
+                pcl_cloud.push_back([p[0], p[1], p[2], p[3]])
+            self.pointcloud = pcl_cloud
+             # 处理点云数据，生成图像和深度图
+            self.rgb, self.depth = self.process_pointcloud(pcl_cloud)
+        except Exception as e:
+            self.node.get_logger().error("Error: {}".format(e))
+
+    def process_pointcloud(self, pcl_cloud):
+        # 获取点云中的点数
+        points = np.asarray(pcl_cloud)
+        
+        # 初始化图像和深度图
+        width, height = 640, 480
+        rgb_image = np.zeros((height, width, 3), dtype=np.uint8)
+        depth_image = np.zeros((height, width), dtype=np.float32)
+        
+        # 投影点云到2D图像平面
+        for point in points:
+            x, y, z, rgb = point
+            # 这里假设一个简单的正交投影，可以根据需要修改为透视投影
+            u = int((x + 10) * width / 20)
+            v = int((y + 10) * height / 20)
+            if 0 <= u < width and 0 <= v < height:
+                rgb_image[v, u] = self.unpack_rgb(rgb)
+                depth_image[v, u] = z
+
+        return rgb_image, depth_image
+
+    def unpack_rgb(self, rgb):
+        # 将单个浮点数RGB值转换为三个8位整数
+        rgb = int(rgb)
+        r = (rgb >> 16) & 0x0000ff
+        g = (rgb >> 8) & 0x0000ff
+        b = (rgb) & 0x0000ff
+        return [r, g, b]
+
 
     def image_callback(self, msg):
         self.image_received = True
